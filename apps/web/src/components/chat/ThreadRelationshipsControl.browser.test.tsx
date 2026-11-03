@@ -194,6 +194,52 @@ it("opens an idle child from Lineage when its shell has not been loaded", async 
   );
 });
 
+it("lists delegated grandchildren under their parent and counts the whole tree", async () => {
+  setup();
+  const delegatedShell = (id: string, parentId: string, fields: Record<string, unknown>) => ({
+    id: ThreadId.make(id),
+    title: id,
+    archivedAt: null,
+    forkedFrom: null,
+    lineage: {
+      rootThreadId: threadId,
+      parentThreadId: ThreadId.make(parentId),
+      relationshipToParent: "subagent",
+    },
+    status: "completed",
+    activityRunStatus: null,
+    pendingRuntimeRequest: null,
+    createdAt: DateTime.makeUnsafe("2026-11-03T16:00:00.000Z"),
+    updatedAt: DateTime.makeUnsafe("2026-11-03T16:00:00.000Z"),
+    ...fields,
+  });
+  state.relatedShells = [
+    delegatedShell("Review scope", "fork", {}),
+    delegatedShell("Scout run", "Review scope", {
+      status: "running",
+      activityRunStatus: "running",
+    }),
+    delegatedShell("Quick check", "fork", {}),
+  ];
+  await using screen = await render(
+    <ThreadRelationshipsPanel
+      environmentId={environmentId}
+      threadId={threadId}
+      showLineage
+      showSideChats
+    />,
+  );
+
+  await expect
+    .element(page.getByText("Lineage · 1 working · 1 waiting · 1 done", { exact: true }))
+    .toBeVisible();
+  await expect.element(page.getByText("Scout run", { exact: true })).toBeVisible();
+  await screen.getByRole("button", { name: "Hide 1 sub-task" }).click();
+  await expect.element(page.getByText("Scout run", { exact: true })).not.toBeInTheDocument();
+  await screen.getByRole("button", { name: "Show 1 sub-task" }).click();
+  await expect.element(page.getByText("Scout run", { exact: true })).toBeVisible();
+});
+
 it("shows a lineage thread's full title in its tooltip", async () => {
   setup();
   const longTitle = "Compare the lineage tooltip against a title that the row truncates";
