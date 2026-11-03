@@ -3,10 +3,13 @@ import { ThreadId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
 import {
+  countThreadSubtaskStates,
   deriveThreadRelationshipGraph,
+  descendantThreadRelationships,
   immediateThreadRelationships,
   orderWebThreadLineageRows,
   resolveMergeBackTargetThreadId,
+  subtaskStatesByThreadId,
   threadRelationshipRowStatus,
 } from "./threadRelationships.ts";
 
@@ -437,5 +440,126 @@ describe("web thread lineage ordering", () => {
         },
       }),
     ).toEqual([dated, missingTransfer, undated]);
+  });
+});
+
+describe("subtask tree", () => {
+  function subtaskShell(input: {
+    readonly id: string;
+    readonly parentThreadId: string | null;
+    readonly status?: string;
+    readonly activityRunStatus?: string | null;
+    readonly pendingRuntimeRequest?: unknown;
+    readonly createdAt?: string;
+  }) {
+    return {
+      id: ThreadId.make(input.id),
+      title: input.id,
+      status: input.status ?? "completed",
+      activityRunStatus: input.activityRunStatus ?? null,
+      pendingRuntimeRequest: input.pendingRuntimeRequest ?? null,
+      archivedAt: null,
+      forkedFrom: null,
+      lineage: {
+        rootThreadId: ThreadId.make("root"),
+        parentThreadId: input.parentThreadId === null ? null : ThreadId.make(input.parentThreadId),
+        relationshipToParent: input.parentThreadId === null ? null : "subagent",
+      },
+      createdAt: DateTime.makeUnsafe(input.createdAt ?? "2026-11-03T16:00:00.000Z"),
+      updatedAt: DateTime.makeUnsafe("2026-11-03T16:00:00.000Z"),
+    };
+  }
+
+  function treeOf(threads: ReadonlyArray<ReturnType<typeof subtaskShell>>) {
+    const graph = deriveThreadRelationshipGraph({ threads: threads as never, projection: null });
+    const rows = descendantThreadRelationships(graph, ThreadId.make("root"));
+    return { graph, rows, states: subtaskStatesByThreadId(graph, rows) };
+  }
+
+  it("walks every descendant depth first with newest siblings first", () => {
+    const { rows } = treeOf([
+      subtaskShell({ id: "root", parentThreadId: null }),
+      subtaskShell({ id: "a", parentThreadId: "root", createdAt: "2026-11-03T16:01:00.000Z" }),
+      subtaskShell({ id: "b", parentThreadId: "root", createdAt: "2026-11-03T16:02:00.000Z" }),
+      subtaskShell({ id: "a1", parentThreadId: "a", createdAt: "2026-11-03T16:03:00.000Z" }),
+      subtaskShell({ id: "a1x", parentThreadId: "a1", createdAt: "2026-11-03T16:04:00.000Z" }),
+    ]);
+
+    expect(rows.map(({ threadId, depth }) => [threadId, depth])).toEqual([
+      [ThreadId.make("b"), 1],
+      [ThreadId.make("a"), 1],
+      [ThreadId.make("a1"), 2],
+      [ThreadId.make("a1x"), 3],
+    ]);
+  });
+
+  it("does not follow fork edges and visits a cycle once", () => {
+    const graph = deriveThreadRelationshipGraph({
+      threads: [
+        subtaskShell({ id: "root", parentThreadId: null }),
+        subtaskShell({ id: "a", parentThreadId: "root" }),
+        {
+          ...subtaskShell({ id: "fork", parentThreadId: "a" }),
+          lineage: {
+            rootThreadId: ThreadId.make("root"),
+            parentThreadId: ThreadId.make("a"),
+            relationshipToParent: "fork",
+          },
+        },
+        subtaskShell({ id: "x", parentThreadId: "y" }),
+        subtaskShell({ id: "y", parentThreadId: "x" }),
+      ] as never,
+      projection: null,
+    });
+    expect(descendantThreadRelationships(graph, ThreadId.make("a"))).toEqual([]);
+    expect(
+      descendantThreadRelationships(graph, ThreadId.make("y")).map(({ threadId }) => threadId),
+    ).toEqual([ThreadId.make("x")]);
+  });
+
+  it("marks a finished child waiting while a grandchild is still running", () => {
+    const { states } = treeOf([
+      subtaskShell({ id: "root", parentThreadId: null }),
+      subtaskShell({ id: "child", parentThreadId: "root", status: "completed" }),
+      subtaskShell({
+        id: "grandchild",
+        parentThreadId: "child",
+        status: "running",
+        activityRunStatus: "running",
+      }),
+    ]);
+
+    expect(states.get(ThreadId.make("child"))).toBe("waiting_on_children");
+    expect(states.get(ThreadId.make("grandchild"))).toBe("working");
+  });
+
+  it("counts the whole tree once per node and keeps a child with live work active", () => {
+    const { rows, states } = treeOf([
+      subtaskShell({ id: "root", parentThreadId: null }),
+      subtaskShell({ id: "a", parentThreadId: "root", status: "running" }),
+      subtaskShell({ id: "a1", parentThreadId: "a", status: "completed" }),
+      subtaskShell({ id: "a2", parentThreadId: "a", status: "failed" }),
+      subtaskShell({
+        id: "b",
+        parentThreadId: "root",
+        status: "completed",
+      }),
+      subtaskShell({
+        id: "b1",
+        parentThreadId: "b",
+        status: "waiting",
+        pendingRuntimeRequest: { requestId: "r1" },
+      }),
+      subtaskShell({ id: "c", parentThreadId: "root", status: "completed" }),
+    ]);
+
+    expect(rows).toHaveLength(6);
+    expect(countThreadSubtaskStates(states.values())).toEqual({
+      needsInput: 1,
+      working: 1,
+      waitingOnChildren: 1,
+      failed: 1,
+      done: 2,
+    });
   });
 });
