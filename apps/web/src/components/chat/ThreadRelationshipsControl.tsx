@@ -15,14 +15,19 @@ import {
 import { formatSubagentDisplayTitle } from "@t3tools/client-runtime/state/subagent-display";
 import { deriveProviderSubagentStatus } from "@t3tools/client-runtime/state/thread-execution";
 import {
+  countThreadSubtaskStates,
   deriveThreadRelationshipGraph,
+  descendantThreadRelationships,
   immediateThreadRelationships,
   isParentThreadRelationship,
+  subtaskStatesByThreadId,
   threadRelationshipRowStatus,
   orderWebThreadLineageRows,
   resolveMergeBackTargetThreadId,
   type ThreadRelationshipEdge,
   type ThreadRelationshipWalkRow,
+  type ThreadSubtaskCounts,
+  type ThreadSubtaskState,
 } from "@t3tools/client-runtime/state/thread-relationships";
 import {
   canDetachThreadProviderSession,
@@ -182,6 +187,25 @@ function ThreadLineageGroup(props: {
       ) : null}
     </div>
   );
+}
+
+/** Whole-tree counts, such as "3 working · 2 waiting · 5 done"; null when there are none. */
+function formatThreadSubtaskSummary(
+  counts: ThreadSubtaskCounts,
+  threadlessRunning: number,
+): string | null {
+  const parts: ReadonlyArray<readonly [number, string]> = [
+    [counts.working + threadlessRunning, "working"],
+    [counts.waitingOnChildren, "waiting"],
+    [counts.needsInput, "needs input"],
+    [counts.failed, "failed"],
+    [counts.done, "done"],
+  ];
+  const text = parts
+    .filter(([count]) => count > 0)
+    .map(([count, label]) => `${count} ${label}`)
+    .join(" · ");
+  return text === "" ? null : text;
 }
 
 function relationshipLabel(edge: ThreadRelationshipEdge, currentThreadId: ThreadId) {
@@ -425,6 +449,9 @@ export function ThreadRelationshipsPanel(props: {
   const mergeErrorToastId = useRef<string | null>(null);
   const detachErrorToastId = useRef<string | null>(null);
   const [stoppingId, setStoppingId] = useState<string | null>(null);
+  const [collapsedSubtreeIds, setCollapsedSubtreeIds] = useState<ReadonlySet<ThreadId>>(
+    () => new Set(),
+  );
   // Derive graphs after hooks to preserve their compiler cache.
   const providers = providersByEnvironment.get(props.environmentId);
   const derivedProviderEntries = deriveProviderInstanceEntries(providers ?? []);
@@ -480,6 +507,32 @@ export function ThreadRelationshipsPanel(props: {
   const currentProject = projects.find((project) => project.id === currentThread?.projectId);
   const latestMergeBackRun = projection === null ? null : resolveLatestMergeBackRun(projection);
   const mergeTargetThreadId = resolveMergeBackTargetThreadId(projection);
+  // Every delegated task under this thread, depth first. Direct children lead their own subtrees.
+  const subtaskRows = descendantThreadRelationships(graph, props.threadId);
+  const subtaskStates = subtaskStatesByThreadId(graph, subtaskRows);
+  const subtaskCounts = countThreadSubtaskStates(subtaskStates.values());
+  const threadlessRunningCount =
+    projection?.subagents.filter(
+      (agent) => agent.childThreadId === null && agent.status === "running",
+    ).length ?? 0;
+  const activeSubtaskCount =
+    subtaskCounts.needsInput +
+    subtaskCounts.working +
+    subtaskCounts.waitingOnChildren +
+    threadlessRunningCount;
+  const subtaskSummary = formatThreadSubtaskSummary(subtaskCounts, threadlessRunningCount);
+  const subtaskStateOverride = (
+    threadId: ThreadId,
+    edge: ThreadRelationshipEdge,
+  ): ThreadSubtaskState | undefined => {
+    const state = subtaskStates.get(threadId);
+    return edge.kind === "subagent" &&
+      !isParentThreadRelationship(edge, props.threadId) &&
+      (state === "needs_input" || state === "waiting_on_children")
+      ? state
+      : undefined;
+  };
+
   const relationshipRows = orderWebThreadLineageRows({
     graph,
     rows: immediateThreadRelationships(graph, props.threadId),
@@ -494,9 +547,14 @@ export function ThreadRelationshipsPanel(props: {
           ? subagentsByThreadId.get(row.threadId)
           : undefined;
       const workflowGroup = agent === undefined ? undefined : workflowGroupsById.get(agent.id);
-      return workflowGroup === undefined
-        ? row
-        : { ...row, edge: { ...row.edge, status: workflowGroup.workflow.status } };
+      const withWorkflow =
+        workflowGroup === undefined
+          ? row
+          : { ...row, edge: { ...row.edge, status: workflowGroup.workflow.status } };
+      const subtaskState = subtaskStateOverride(row.threadId, row.edge);
+      return subtaskState === undefined
+        ? withWorkflow
+        : { ...withWorkflow, edge: { ...withWorkflow.edge, status: subtaskState } };
     });
   const canMerge = mergeTargetThreadId !== null && latestMergeBackRun !== null;
   const canDetach = projection ? canDetachThreadProviderSession(projection) : false;
@@ -527,10 +585,6 @@ export function ThreadRelationshipsPanel(props: {
     (agent): agent is OrchestrationV2Subagent & { remoteChild: OrchestrationV2RemoteTaskChild } =>
       agent.remoteChild !== undefined,
   );
-  const runningCount =
-    (projection?.subagents.filter(
-      (agent) => agent.childThreadId === null && agent.status === "running",
-    ).length ?? 0) + active.filter(({ edge }) => edge.status === "running").length;
 
   // A linked environment's agent may have delegated this thread from there.
   const delegatedFrom = currentThread?.delegatedFrom;
@@ -540,7 +594,7 @@ export function ThreadRelationshipsPanel(props: {
     (related.length > 0 ||
       active.length > 0 ||
       previous.length > 0 ||
-      runningCount > 0 ||
+      activeSubtaskCount > 0 ||
       remoteSubagents.length > 0 ||
       delegatedFrom !== undefined ||
       // Disconnect lives in this heading, so a thread with only side chats still shows it.
@@ -643,15 +697,17 @@ export function ThreadRelationshipsPanel(props: {
         ? null
         : (graph.nodes.get(mergeTargetThreadId)?.thread?.title ?? null);
 
-  const renderRelationshipRow = ({ threadId, edge }: ThreadRelationshipWalkRow) => {
+  const renderRelationshipRow = ({ threadId, edge }: ThreadRelationshipWalkRow, indent = 0) => {
     const node = graph.nodes.get(threadId);
     const isSubagent = edge.kind === "subagent";
     const isMergeTarget = threadId === mergeTargetThreadId;
     const isParent = isParentThreadRelationship(edge, props.threadId);
     const rowStatus =
+      subtaskStateOverride(threadId, edge) ??
       (isParent && threadId === parentRef?.threadId
         ? (node?.thread?.activityRunStatus ?? parentNativeStatus)
-        : undefined) ?? threadRelationshipRowStatus(graph, { threadId, edge });
+        : undefined) ??
+      threadRelationshipRowStatus(graph, { threadId, edge });
     const RelationshipIcon = isParent
       ? CornerLeftUpIcon
       : isSubagent
@@ -795,7 +851,11 @@ export function ThreadRelationshipsPanel(props: {
       );
     }
     return (
-      <li key={threadId} className="group relative flex h-8 items-center rounded-lg">
+      <li
+        key={threadId}
+        className="group relative flex h-8 items-center rounded-lg"
+        style={indent > 0 ? { paddingLeft: `${indent * 1.25}rem` } : undefined}
+      >
         {isMergeTarget ? (
           <div className={THREAD_DETAILS_PANEL_SPLIT_GROUP_CLASS}>
             <Tooltip>
@@ -884,15 +944,77 @@ export function ThreadRelationshipsPanel(props: {
     );
   };
 
+  const toggleSubtree = (threadId: ThreadId) =>
+    setCollapsedSubtreeIds((previous) => {
+      const next = new Set(previous);
+      if (next.has(threadId)) next.delete(threadId);
+      else next.add(threadId);
+      return next;
+    });
+
+  // A delegated child's own tasks follow its row, behind a toggle, at one more level of indent.
+  const renderRowWithSubtree = (row: ThreadRelationshipWalkRow): ReactNode[] => {
+    const rendered = [renderRelationshipRow(row)];
+    if (row.edge.kind !== "subagent" || isParentThreadRelationship(row.edge, props.threadId)) {
+      return rendered;
+    }
+    const startIndex = subtaskRows.findIndex((candidate) => candidate.threadId === row.threadId);
+    if (startIndex === -1) return rendered;
+    const rowDepth = subtaskRows[startIndex]!.depth;
+    const descendants: ThreadRelationshipWalkRow[] = [];
+    for (let index = startIndex + 1; index < subtaskRows.length; index += 1) {
+      const candidate = subtaskRows[index]!;
+      if (candidate.depth <= rowDepth) break;
+      if (!isHiddenRelation(candidate.threadId) && !isHiddenUnloadedRelation(candidate)) {
+        descendants.push(candidate);
+      }
+    }
+    if (descendants.length === 0) return rendered;
+    const expanded = !collapsedSubtreeIds.has(row.threadId);
+    rendered.push(
+      <li
+        key={`${row.threadId}:subtasks`}
+        className="flex h-7 items-center"
+        style={{ paddingLeft: "1.25rem" }}
+      >
+        <ThreadDetailsControl
+          size="sm"
+          aria-expanded={expanded}
+          onClick={() => toggleSubtree(row.threadId)}
+          className="w-full"
+        >
+          <ChevronDownIcon
+            aria-hidden
+            className={cn(
+              THREAD_DETAILS_PANEL_CHEVRON_CLASS,
+              "transition-transform",
+              !expanded && "-rotate-90",
+            )}
+          />
+          <span className="min-w-0 flex-1 truncate text-left text-xs text-muted-foreground">
+            {expanded ? "Hide" : "Show"} {descendants.length}{" "}
+            {descendants.length === 1 ? "sub-task" : "sub-tasks"}
+          </span>
+        </ThreadDetailsControl>
+      </li>,
+    );
+    if (expanded) {
+      for (const descendant of descendants) {
+        rendered.push(renderRelationshipRow(descendant, descendant.depth - rowDepth + 1));
+      }
+    }
+    return rendered;
+  };
+
   return (
     <>
       {lineageVisible ? (
         <ThreadDetailsSection
           headingId="thread-details-lineage-heading"
-          title={runningCount > 0 ? `Lineage · ${runningCount} running` : "Lineage"}
+          title={subtaskSummary === null ? "Lineage" : `Lineage · ${subtaskSummary}`}
           // A lone "Previous agents" row names itself; the heading returns for status or actions.
           showHeading={
-            runningCount > 0 ||
+            activeSubtaskCount > 0 ||
             canDetach ||
             related.length > 0 ||
             active.length > 0 ||
@@ -935,7 +1057,7 @@ export function ThreadRelationshipsPanel(props: {
           )}
           {groups.map((group) => (
             <ThreadLineageGroup key={`${scopedThreadKey(ref)}:${group.id}`} {...group}>
-              {(visibleRows) => visibleRows.map(renderRelationshipRow)}
+              {(visibleRows) => visibleRows.flatMap((row) => renderRowWithSubtree(row))}
             </ThreadLineageGroup>
           ))}
           {remoteSubagents.length > 0 ? (
@@ -966,7 +1088,7 @@ export function ThreadRelationshipsPanel(props: {
             rows={sideChats}
             expanded
           >
-            {(visibleRows) => visibleRows.map(renderRelationshipRow)}
+            {(visibleRows) => visibleRows.map((row) => renderRelationshipRow(row))}
           </ThreadLineageGroup>
         </ThreadDetailsSection>
       ) : null}

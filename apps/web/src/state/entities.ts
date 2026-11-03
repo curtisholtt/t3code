@@ -409,8 +409,27 @@ export function selectThreadRelationshipShells(
   const current = threads.find((thread) => thread.id === threadId);
   const currentParentId = current === undefined ? null : shellParentThreadId(current);
   if (currentParentId !== null) named.add(currentParentId);
+  // Delegated tasks nest: a child's own tasks are grandchildren here, and so on down.
+  const delegatedDescendantIds = new Set<string>([threadId]);
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const thread of threads) {
+      if (
+        thread.lineage.relationshipToParent === "subagent" &&
+        !delegatedDescendantIds.has(thread.id) &&
+        shellParentThreadId(thread) !== null &&
+        delegatedDescendantIds.has(shellParentThreadId(thread)!)
+      ) {
+        delegatedDescendantIds.add(thread.id);
+        grew = true;
+      }
+    }
+  }
   return threads.filter(
-    (thread) => named.has(thread.id) || shellParentThreadId(thread) === threadId,
+    (thread) =>
+      named.has(thread.id) ||
+      shellParentThreadId(thread) === threadId ||
+      delegatedDescendantIds.has(thread.id),
   );
 }
 

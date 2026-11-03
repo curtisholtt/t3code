@@ -18,6 +18,10 @@ export function threadRelationshipStatusLabel(status: string | null): string {
     case "waiting":
     case "blocked":
       return "Waiting";
+    case "waiting_on_children":
+      return "Waiting on sub-tasks";
+    case "needs_input":
+      return "Needs input";
     case "completed":
       return "Done";
     case "failed":
@@ -82,16 +86,19 @@ export function ThreadRelationshipIcon({
         className={cn(
           "absolute size-2 rounded-full border-2 border-card",
           showInstanceBadge ? "-left-1 -top-1" : "-bottom-1 -right-1",
-          status === "running" ||
-            status === "in_progress" ||
-            status === "pending" ||
-            status === "waiting"
-            ? "bg-info"
-            : status === "failed" || status === "error"
-              ? "bg-destructive"
-              : status === "completed"
-                ? "bg-success"
-                : "bg-muted-foreground/45",
+          status === "needs_input"
+            ? "bg-warning"
+            : status === "running" ||
+                status === "in_progress" ||
+                status === "pending" ||
+                status === "waiting" ||
+                status === "waiting_on_children"
+              ? "bg-info"
+              : status === "failed" || status === "error"
+                ? "bg-destructive"
+                : status === "completed"
+                  ? "bg-success"
+                  : "bg-muted-foreground/45",
         )}
         aria-hidden="true"
       />
