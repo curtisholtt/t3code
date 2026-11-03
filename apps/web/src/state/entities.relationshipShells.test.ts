@@ -64,4 +64,26 @@ describe("selectThreadRelationshipShells", () => {
       ),
     ).toEqual(["current", "parent"]);
   });
+  it("keeps delegated grandchildren and deeper, but not forks of a child", () => {
+    const delegated = (id: string, parentThreadId: string) =>
+      ({
+        id,
+        forkedFrom: null,
+        lineage: { parentThreadId, relationshipToParent: "subagent" },
+      }) as unknown as OrchestrationV2ThreadShell;
+    const threads = [
+      shell("current"),
+      delegated("child", "current"),
+      delegated("grandchild", "child"),
+      delegated("great-grandchild", "grandchild"),
+      shell("fork-of-child", "child"),
+      shell("unrelated-root"),
+    ];
+
+    expect(
+      selectThreadRelationshipShells(threadId, null as Projection, threads).map(
+        (thread) => thread.id,
+      ),
+    ).toEqual(["current", "child", "grandchild", "great-grandchild"]);
+  });
 });
